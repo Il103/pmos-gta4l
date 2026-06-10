@@ -1,5 +1,0 @@
-ACTION=="add|change", KERNEL=="input[0-9]*", \
-    SUBSYSTEM=="input", \
-    ATTRS{name}=="sm6115_aw8695_haptic", \
-    TAG+="uaccess", \
-    ENV{FEEDBACKD_TYPE}="vibra"
