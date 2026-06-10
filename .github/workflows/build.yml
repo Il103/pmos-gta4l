@@ -1,0 +1,283 @@
+name: Build PostmarketOS - gta4l (SM-T505N)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ui:
+        description: 'واجهة المستخدم'
+        required: true
+        default: 'phosh'
+        type: choice
+        options:
+          - phosh
+          - plasma-mobile
+          - sxmo-de-sway
+
+jobs:
+  build:
+    name: "🏗️ Build pmOS - gta4l"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      # ────────────────────────────────────────
+      # 1. Checkout
+      # ────────────────────────────────────────
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ────────────────────────────────────────
+      # 2. Free disk space
+      # ────────────────────────────────────────
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+          df -h
+
+      # ────────────────────────────────────────
+      # 3. Install dependencies
+      # ────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y \
+            git python3 python3-pip openssl \
+            android-sdk-libsparse-utils \
+            abootimg wget zip unzip \
+            qemu-user-static binfmt-support
+
+      # ────────────────────────────────────────
+      # 4. Install pmbootstrap & Prepare Aports
+      # ────────────────────────────────────────
+      - name: Install pmbootstrap
+        run: |
+          # Clone the official repo
+          git clone --depth=1 https://gitlab.postmarketos.org/postmarketOS/pmbootstrap.git /home/runner/pmbootstrap_repo
+          
+          # Install globally using sudo to ensure it's in /usr/local/bin
+          cd /home/runner/pmbootstrap_repo
+          sudo python3 setup.py install
+          
+          # Verify installation
+          pmbootstrap --version
+          
+          # Prepare aports structure
+          mkdir -p aports/device/postmarketos/device-samsung-gta4l
+          mkdir -p aports/main/linux-samsung-gta4l
+          
+          # Copy project files (using current structure)
+          cp -rv $GITHUB_WORKSPACE/device/device-samsung-gta4l/* aports/device/postmarketos/device-samsung-gta4l/
+          cp -rv $GITHUB_WORKSPACE/kernel/linux-samsung-gta4l/* aports/main/linux-samsung-gta4l/
+
+      # ────────────────────────────────────────
+      # 5. Setup pmbootstrap config
+      # ────────────────────────────────────────
+      - name: Setup pmbootstrap config
+        run: |
+          mkdir -p ~/.config/pmbootstrap
+          cat > ~/.config/pmbootstrap/config << EOF
+          [pmbootstrap]
+          aports = /home/runner/pmbootstrap_repo/aports
+          device = samsung-gta4l
+          user = user
+          ui = ${{ github.event.inputs.ui }}
+          ui_extras = false
+          hostname = gta4l-pmos
+          is_default_channel = false
+          channel = edge
+          kernel = downstream
+          ssh_keys = false
+          timezone = UTC
+          locale = en_US.UTF-8
+          target_architecture = aarch64
+          work = /home/runner/pmbootstrap-work
+          jobs = $(nproc)
+          ccache_size = 5G
+          mirror_alpine = https://dl-cdn.alpinelinux.org/alpine/
+          mirror_postmarketos = https://mirror.postmarketos.org/postmarketos/
+          EOF
+
+      # ────────────────────────────────────────
+      # 6. Init pmbootstrap
+      # ────────────────────────────────────────
+      - name: Init pmbootstrap
+        run: |
+          # Use full path to be 100% sure if needed, but global install should work
+          echo "y" | pmbootstrap init --fast 2>&1 | tail -20
+
+      # ────────────────────────────────────────
+      # 7. Build kernel
+      # ────────────────────────────────────────
+      - name: Build kernel (linux-samsung-gta4l)
+        run: |
+          pmbootstrap build --arch=aarch64 linux-samsung-gta4l 2>&1 | tee ~/build_kernel.log
+          echo "✅ Kernel build done"
+
+      # ────────────────────────────────────────
+      # 8. Build device package
+      # ────────────────────────────────────────
+      - name: Build device package
+        run: |
+          pmbootstrap build --arch=aarch64 device-samsung-gta4l 2>&1 | tee ~/build_device.log
+          echo "✅ Device package done"
+
+      # ────────────────────────────────────────
+      # 9. Build full image
+      # ────────────────────────────────────────
+      - name: Build PostmarketOS image
+        run: |
+          pmbootstrap install \
+            --sdcard=/dev/null \
+            --no-local-pkgs \
+            2>&1 | tee ~/build_image.log
+          echo "✅ Image build done"
+
+      # ────────────────────────────────────────
+      # 10. Export images
+      # ────────────────────────────────────────
+      - name: Export boot + rootfs images
+        run: |
+          mkdir -p ~/output
+          pmbootstrap export ~/output 2>&1
+          ls -lh ~/output/
+
+      # ────────────────────────────────────────
+      # 11. Package TWRP flashable ZIP
+      # ────────────────────────────────────────
+      - name: Package TWRP flashable ZIP
+        run: |
+          mkdir -p ~/flashable/META-INF/com/google/android
+          mkdir -p ~/flashable/images
+
+          # Copy images
+          cp ~/output/boot.img    ~/flashable/images/ 2>/dev/null || \
+          cp ~/output/vmlinuz     ~/flashable/images/boot.img
+          cp ~/output/samsung-gta4l.img ~/flashable/images/rootfs.img 2>/dev/null || \
+          cp ~/output/*.img       ~/flashable/images/ 2>/dev/null || true
+
+          # Write update-binary
+          cat > ~/flashable/META-INF/com/google/android/update-binary << 'SCRIPT'
+          #!/sbin/sh
+          OUTFD=$2
+          ZIPFILE=$3
+          ui_print() { echo "ui_print $1" >> /proc/self/fd/$OUTFD; echo "ui_print " >> /proc/self/fd/$OUTFD; }
+          abort()    { ui_print "❌ $1"; exit 1; }
+
+          cd /tmp
+          unzip -o "$ZIPFILE" -d /tmp/pmos-install
+
+          ui_print "╔══════════════════════════════════════╗"
+          ui_print "║  PostmarketOS - Samsung gta4l        ║"
+          ui_print "║  SM-T505 / SM-T505N / T505C / T507   ║"
+          ui_print "╚══════════════════════════════════════╝"
+          ui_print " "
+
+          # Device check
+          DEVICE=$(getprop ro.product.device)
+          ui_print "▶ Device: $DEVICE"
+          case "$DEVICE" in
+            gta4l|gta4lx) ui_print "✅ Device supported!" ;;
+            *) abort "Wrong device: $DEVICE — only gta4l!" ;;
+          esac
+
+          # Flash boot.img
+          ui_print "▶ Flashing boot.img..."
+          dd if=/tmp/pmos-install/images/boot.img \
+             of=/dev/block/bootdevice/by-name/boot bs=4096 \
+             || abort "Failed to flash boot!"
+          ui_print "✅ Boot flashed"
+
+          # Flash rootfs
+          ui_print "▶ Flashing rootfs..."
+          dd if=/tmp/pmos-install/images/rootfs.img \
+             of=/dev/block/bootdevice/by-name/userdata bs=4096 \
+             || abort "Failed to flash rootfs!"
+          ui_print "✅ Rootfs flashed"
+
+          # Verify
+          ui_print " "
+          ui_print "▶ Verifying..."
+          dd if=/dev/block/bootdevice/by-name/boot bs=512 count=1 2>/dev/null | \
+            od -A x -t x1z | head -1 | grep -q "7f 45 4c 46\|1f 8b\|1e 26" \
+            && ui_print "✅ Boot partition: OK" \
+            || ui_print "⚠ Boot partition: check manually"
+
+          rm -rf /tmp/pmos-install
+          sync
+
+          ui_print " "
+          ui_print "╔══════════════════════════════════════╗"
+          ui_print "║  ✅ PostmarketOS installed!           ║"
+          ui_print "║  ➡ Reboot to System                  ║"
+          ui_print "║  ⏳ First boot = 1-3 minutes          ║"
+          ui_print "╚══════════════════════════════════════╝"
+          exit 0
+          SCRIPT
+
+          echo "# PostmarketOS gta4l" \
+            > ~/flashable/META-INF/com/google/android/updater-script
+          chmod +x ~/flashable/META-INF/com/google/android/update-binary
+
+          # Build ZIP
+          DATE=$(date +%Y%m%d)
+          UI="${{ github.event.inputs.ui }}"
+          ZIPNAME="PostmarketOS-gta4l-${UI}-${DATE}.zip"
+          cd ~/flashable
+          zip -r9 ~/${ZIPNAME} .
+          sha256sum ~/${ZIPNAME} > ~/${ZIPNAME}.sha256
+          echo "ZIP_NAME=${ZIPNAME}" >> $GITHUB_ENV
+          ls -lh ~/${ZIPNAME}
+
+      # ────────────────────────────────────────
+      # 12. Upload artifacts
+      # ────────────────────────────────────────
+      - name: Upload flashable ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: PostmarketOS-gta4l-${{ github.event.inputs.ui }}
+          path: |
+            ~/${{ env.ZIP_NAME }}
+            ~/${{ env.ZIP_NAME }}.sha256
+          retention-days: 7
+
+      - name: Upload raw images
+        uses: actions/upload-artifact@v4
+        with:
+          name: raw-images-gta4l
+          path: ~/output/
+          retention-days: 3
+
+      - name: Upload build logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-logs
+          path: |
+            ~/build_kernel.log
+            ~/build_device.log
+            ~/build_image.log
+          retention-days: 3
+
+      # ────────────────────────────────────────
+      # 13. Summary
+      # ────────────────────────────────────────
+      - name: Build summary
+        if: always()
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## PostmarketOS - gta4l Build
+
+          | | |
+          |---|---|
+          | 📱 Device | SM-T505 / SM-T505N / SM-T505C / SM-T507 |
+          | 🖥️ UI | ${{ github.event.inputs.ui }} |
+          | 📅 Date | $(date +%Y-%m-%d) |
+          | 📦 ZIP | \`${{ env.ZIP_NAME }}\` |
+
+          ### Flash Instructions
+          1. Boot into **TWRP**
+          2. Install → اختار الـ ZIP
+          3. Swipe to Flash ✅
+          4. Reboot to System
+          EOF
